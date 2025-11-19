@@ -22,6 +22,7 @@ __all__ = (
     "DeformableTransformerDecoderLayer",
     "MSDeformAttn",
     "MLP",
+    "DMMALayer",
 )
 
 
@@ -425,3 +426,271 @@ class DeformableTransformerDecoder(nn.Module):
             refer_bbox = refined_bbox.detach() if self.training else refined_bbox
 
         return torch.stack(dec_bboxes), torch.stack(dec_cls)
+
+
+class MinusSigmoid(nn.Module):
+    """Custom sigmoid used by the DMMA mask branch."""
+
+    def forward(self, x):
+        """Return 1 - sigmoid(x) to highlight large differences."""
+        return 1.0 - torch.sigmoid(x)
+
+
+def _to_2tuple(val):
+    """Convert an int or iterable into a 2-tuple."""
+    return (val, val) if isinstance(val, int) else val
+
+
+def dmma_window_partition(x, window_size):
+    """
+    Partition (B, H, W, C) tensors into non-overlapping windows.
+
+    Returns:
+        torch.Tensor: (num_windows * B, window_size, window_size, C)
+    """
+    b, h, w, c = x.shape
+    x = x.view(b, h // window_size, window_size, w // window_size, window_size, c)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    return windows.view(-1, window_size, window_size, c)
+
+
+def dmma_window_reverse(windows, window_size, h, w):
+    """Reverse dmma_window_partition."""
+    b = windows.shape[0] // (h * w // window_size // window_size)
+    x = windows.view(b, h // window_size, w // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    return x.view(b, h, w, -1)
+
+
+class DifferenceMaskAttention(nn.Module):
+    """Difference Mask Mixed Attention (DMMA) module."""
+
+    def __init__(
+        self,
+        dim,
+        window_size,
+        num_heads,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        """Initialize DMMA with windowed relative position bias and additional mask branch."""
+        super().__init__()
+        self.dim = dim
+        self.window_size = _to_2tuple(window_size)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim**-0.5
+
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), num_heads)
+        )
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += self.window_size[0] - 1
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkvm = nn.Linear(dim, dim * 4, bias=qkv_bias)
+        self.minus_sigmoid = MinusSigmoid()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        """Apply DMMA attention on flattened windows."""
+        b_, n, c = x.shape
+        x_max = torch.max(x)
+        x_min = torch.min(x)
+        x_range = torch.clamp(x_max - x_min, min=1e-6)
+        x = (x - x_min) / x_range
+
+        qkvm = self.qkvm(x).reshape(b_, n, 4, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v, m = qkvm[0], qkvm[1], qkvm[2], qkvm[3]
+        k = k * self.scale
+
+        m1 = m.float().repeat_interleave(n, dim=3)
+        m2 = m.float().transpose(-2, -1).reshape(b_, self.num_heads, 1, n * (c // self.num_heads))
+        m2 = torch.abs(m2).repeat_interleave(n, dim=2)
+        m3 = torch.abs(m1 - m2).reshape(b_, self.num_heads, n, c // self.num_heads, n).permute(0, 1, 3, 2, 4)
+        m0 = m2.reshape(b_, self.num_heads, n, c // self.num_heads, n).permute(0, 1, 3, 2, 4)
+        m0 = torch.sum(m0, 2).clamp_min(1e-6)
+        m3 = torch.sum(m3, 2)
+        dm_mask = self.minus_sigmoid(m3 / m0)
+
+        attn = q @ k.transpose(-2, -1)
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1],
+            self.window_size[0] * self.window_size[1],
+            -1,
+        )
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            n_w = mask.shape[0]
+            attn = attn.view(b_ // n_w, n_w, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, n, n)
+        attn = self.attn_drop(attn)
+        attn = self.softmax(attn * dm_mask)
+
+        x = (attn @ v).transpose(1, 2).reshape(b_, n, c)
+        x = self.proj(x)
+        return self.proj_drop(x)
+
+
+class DMMAMlp(nn.Module):
+    """Feed-forward network for DMMA blocks."""
+
+    def __init__(self, in_features, hidden_features=None, act_layer=nn.GELU, drop=0.0):
+        super().__init__()
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        """Apply two-layer MLP with dropout."""
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        return self.drop(x)
+
+
+class DMMAChannelAttention(nn.Module):
+    """ECA-based channel interaction used inside DMMA blocks."""
+
+    def __init__(self, channels, k_size=3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x):
+        """Return a channel-wise attention mask."""
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        return self.act(y)
+
+
+class DropPath(nn.Module):
+    """Stochastic depth regularization."""
+
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        """Randomly drop paths during training."""
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        if keep_prob > 0.0:
+            random_tensor = random_tensor / keep_prob
+        return x * random_tensor
+
+
+class DMMALayer(nn.Module):
+    """Window-based self-attention block enhanced with DMMA and channel attention."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=4,
+        window_size=8,
+        shift_size=0,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.shift_size = shift_size
+
+        self.norm1 = norm_layer(dim)
+        self.attn = DifferenceMaskAttention(
+            dim,
+            window_size=window_size,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+        self.channel_attn = DMMAChannelAttention(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = DMMAMlp(dim, int(dim * mlp_ratio), act_layer, drop)
+
+    def create_mask(self, h, w, device):
+        """Create SW-MSA mask."""
+        img_mask = torch.zeros((1, h, w, 1), device=device)
+        h_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        cnt = 0
+        for hs in h_slices:
+            for ws in w_slices:
+                img_mask[:, hs, ws, :] = cnt
+                cnt += 1
+
+        mask_windows = dmma_window_partition(img_mask, self.window_size).view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
+
+    def forward(self, x):
+        """Forward pass for DMMA Swin-like layer."""
+        b, c, h, w = x.shape
+        pad_h = (self.window_size - h % self.window_size) % self.window_size
+        pad_w = (self.window_size - w % self.window_size) % self.window_size
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        hp, wp = h + pad_h, w + pad_w
+
+        channel_mask = self.channel_attn(x).permute(0, 2, 3, 1)
+        shortcut = x.permute(0, 2, 3, 1).contiguous().view(b, hp * wp, c)
+        out = self.norm1(shortcut).view(b, hp, wp, c)
+
+        if self.shift_size > 0:
+            shifted = torch.roll(out, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            attn_mask = self.create_mask(hp, wp, out.device)
+        else:
+            shifted = out
+            attn_mask = None
+
+        windows = dmma_window_partition(shifted, self.window_size).view(-1, self.window_size * self.window_size, c)
+        attn_windows = self.attn(windows, attn_mask)
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, c)
+        shifted = dmma_window_reverse(attn_windows, self.window_size, hp, wp)
+        shifted = shifted * channel_mask.expand_as(out)
+
+        if self.shift_size > 0:
+            out = torch.roll(shifted, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            out = shifted
+
+        out = shortcut + self.drop_path(out.view(b, hp * wp, c))
+        out = out + self.drop_path(self.mlp(self.norm2(out)))
+        out = out.view(b, hp, wp, c).permute(0, 3, 1, 2).contiguous()
+
+        if pad_h or pad_w:
+            out = out[:, :, :h, :w]
+        return out
