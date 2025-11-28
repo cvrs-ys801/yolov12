@@ -1,0 +1,11 @@
+# MASATI dataset configuration for YOLOv12
+# Root directory already contains images/ and labels/ subfolders in YOLO format.
+
+path: D:/02-WorkSpace/01-Python/yolov12/MASATI
+train: images/train
+val: images/val
+test: images/test
+
+nc: 1
+names:
+  0: ship
