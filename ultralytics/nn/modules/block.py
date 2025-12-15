@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
-from .transformer import DMMALayer, TransformerBlock
+from .transformer import DMMALayer, MSDMMALayer, TransformerBlock
 
 __all__ = (
     "DFL",
@@ -491,18 +491,33 @@ class C2fDMMA(nn.Module):
         self.c = int(c2 * e)
         if self.c % num_heads != 0:
             raise ValueError(f"Channels {self.c} must be divisible by num_heads {num_heads}.")
+        window_sizes = window_size if isinstance(window_size, (list, tuple)) else [window_size]
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
-        self.m = nn.ModuleList(
-            DMMALayer(
-                self.c,
-                num_heads=num_heads,
-                window_size=window_size,
-                shift_size=(window_size // 2 if (shift and i % 2 == 1) else 0),
-                mlp_ratio=mlp_ratio,
-            )
-            for i in range(n)
-        )
+        self.multi_scale = len(window_sizes) > 1
+        self.m = nn.ModuleList()
+        for i in range(n):
+            if self.multi_scale:
+                self.m.append(
+                    MSDMMALayer(
+                        self.c,
+                        num_heads=num_heads,
+                        window_sizes=window_sizes,
+                        shift=shift and i % 2 == 1,
+                        mlp_ratio=mlp_ratio,
+                    )
+                )
+            else:
+                ws = window_sizes[0]
+                self.m.append(
+                    DMMALayer(
+                        self.c,
+                        num_heads=num_heads,
+                        window_size=ws,
+                        shift_size=(ws // 2 if (shift and i % 2 == 1) else 0),
+                        mlp_ratio=mlp_ratio,
+                    )
+                )
 
     def forward(self, x):
         """Forward pass through DMMA-enhanced C2f layer."""

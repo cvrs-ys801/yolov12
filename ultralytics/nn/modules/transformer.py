@@ -23,6 +23,7 @@ __all__ = (
     "MSDeformAttn",
     "MLP",
     "DMMALayer",
+    "MSDMMALayer",
 )
 
 
@@ -441,6 +442,17 @@ def _to_2tuple(val):
     return (val, val) if isinstance(val, int) else val
 
 
+def _auto_eca_kernel(channels, gamma=2, b=1):
+    """
+    Compute a dynamic odd kernel size for ECA-style channel attention.
+
+    The formulation follows the ECA paper: k = |(log2(C) + b) / gamma| rounded to nearest odd.
+    """
+    k = int(abs((math.log2(channels) + b) / gamma))
+    k = k if k % 2 else k + 1
+    return max(k, 3)
+
+
 def dmma_window_partition(x, window_size):
     """
     Partition (B, H, W, C) tensors into non-overlapping windows.
@@ -503,6 +515,8 @@ class DifferenceMaskAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.head_temperature = nn.Parameter(torch.ones(num_heads))
+        self.mask_scale = nn.Parameter(torch.ones(num_heads))
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
 
         self.softmax = nn.Softmax(dim=-1)
@@ -541,8 +555,11 @@ class DifferenceMaskAttention(nn.Module):
             n_w = mask.shape[0]
             attn = attn.view(b_ // n_w, n_w, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, n, n)
+        temp = self.head_temperature.view(1, self.num_heads, 1, 1).clamp(min=0.01)
+        mask_gain = self.mask_scale.view(1, self.num_heads, 1, 1)
+        attn = attn / temp
+        attn = self.softmax(attn * (dm_mask * mask_gain))
         attn = self.attn_drop(attn)
-        attn = self.softmax(attn * dm_mask)
 
         x = (attn @ v).transpose(1, 2).reshape(b_, n, c)
         x = self.proj(x)
@@ -572,17 +589,24 @@ class DMMAMlp(nn.Module):
 class DMMAChannelAttention(nn.Module):
     """ECA-based channel interaction used inside DMMA blocks."""
 
-    def __init__(self, channels, k_size=3):
+    def __init__(self, channels, k_size=None):
         super().__init__()
+        k = k_size or _auto_eca_kernel(channels)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.conv_avg = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.conv_max = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1))
         self.act = nn.Sigmoid()
 
     def forward(self, x):
         """Return a channel-wise attention mask."""
-        y = self.avg_pool(x)
-        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        return self.act(y)
+        y_avg = self.avg_pool(x)
+        y_max = self.max_pool(x)
+        y = self.conv_avg(y_avg.squeeze(-1).transpose(-1, -2))
+        y = y + self.conv_max(y_max.squeeze(-1).transpose(-1, -2))
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        return self.act(y * self.scale)
 
 
 class DropPath(nn.Module):
@@ -693,4 +717,50 @@ class DMMALayer(nn.Module):
 
         if pad_h or pad_w:
             out = out[:, :, :h, :w]
+        return out
+
+
+class MSDMMALayer(nn.Module):
+    """Multi-scale DMMA wrapper with learnable branch gates."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=4,
+        window_sizes=(4, 8),
+        shift=False,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        self.window_sizes = list(window_sizes)
+        self.gates = nn.Parameter(torch.zeros(len(self.window_sizes)))
+        self.branches = nn.ModuleList(
+            DMMALayer(
+                dim,
+                num_heads=num_heads,
+                window_size=ws,
+                shift_size=ws // 2 if shift else 0,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop=drop,
+                attn_drop=attn_drop,
+                drop_path=drop_path,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+            )
+            for ws in self.window_sizes
+        )
+
+    def forward(self, x):
+        """Fuse multi-scale DMMA outputs with softmax-normalized gates."""
+        weights = torch.softmax(self.gates, dim=0)
+        out = 0
+        for w, branch in zip(weights, self.branches):
+            out = out + w * branch(x)
         return out
