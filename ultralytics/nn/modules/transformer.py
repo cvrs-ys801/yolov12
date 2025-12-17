@@ -524,6 +524,8 @@ class DifferenceMaskAttention(nn.Module):
     def forward(self, x, mask=None):
         """Apply DMMA attention on flattened windows."""
         b_, n, c = x.shape
+        input_dtype = x.dtype  # 记录输入数据类型以便 AMP 兼容
+        
         x_max = torch.max(x)
         x_min = torch.min(x)
         x_range = torch.clamp(x_max - x_min, min=1e-6)
@@ -533,14 +535,18 @@ class DifferenceMaskAttention(nn.Module):
         q, k, v, m = qkvm[0], qkvm[1], qkvm[2], qkvm[3]
         k = k * self.scale
 
-        m1 = m.float().repeat_interleave(n, dim=3)
-        m2 = m.float().transpose(-2, -1).reshape(b_, self.num_heads, 1, n * (c // self.num_heads))
+        # 差分掩码计算 - 使用 float32 确保数值稳定性
+        m_fp32 = m.float()
+        m1 = m_fp32.repeat_interleave(n, dim=3)
+        m2 = m_fp32.transpose(-2, -1).reshape(b_, self.num_heads, 1, n * (c // self.num_heads))
         m2 = torch.abs(m2).repeat_interleave(n, dim=2)
         m3 = torch.abs(m1 - m2).reshape(b_, self.num_heads, n, c // self.num_heads, n).permute(0, 1, 3, 2, 4)
         m0 = m2.reshape(b_, self.num_heads, n, c // self.num_heads, n).permute(0, 1, 3, 2, 4)
         m0 = torch.sum(m0, 2).clamp_min(1e-6)
         m3 = torch.sum(m3, 2)
         dm_mask = self.minus_sigmoid(m3 / m0)
+        # 转换回输入数据类型以确保 AMP 兼容
+        dm_mask = dm_mask.to(input_dtype)
 
         attn = q @ k.transpose(-2, -1)
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
@@ -549,14 +555,14 @@ class DifferenceMaskAttention(nn.Module):
             -1,
         )
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
+        attn = attn + relative_position_bias.unsqueeze(0).to(input_dtype)
 
         if mask is not None:
             n_w = mask.shape[0]
-            attn = attn.view(b_ // n_w, n_w, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(b_ // n_w, n_w, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0).to(input_dtype)
             attn = attn.view(-1, self.num_heads, n, n)
-        temp = self.head_temperature.view(1, self.num_heads, 1, 1).clamp(min=0.01)
-        mask_gain = self.mask_scale.view(1, self.num_heads, 1, 1)
+        temp = self.head_temperature.view(1, self.num_heads, 1, 1).clamp(min=0.01).to(input_dtype)
+        mask_gain = self.mask_scale.view(1, self.num_heads, 1, 1).to(input_dtype)
         attn = attn / temp
         attn = self.softmax(attn * (dm_mask * mask_gain))
         attn = self.attn_drop(attn)
@@ -601,12 +607,13 @@ class DMMAChannelAttention(nn.Module):
 
     def forward(self, x):
         """Return a channel-wise attention mask."""
+        input_dtype = x.dtype  # AMP 兼容
         y_avg = self.avg_pool(x)
         y_max = self.max_pool(x)
         y = self.conv_avg(y_avg.squeeze(-1).transpose(-1, -2))
         y = y + self.conv_max(y_max.squeeze(-1).transpose(-1, -2))
         y = y.transpose(-1, -2).unsqueeze(-1)
-        return self.act(y * self.scale)
+        return self.act(y * self.scale.to(input_dtype))
 
 
 class DropPath(nn.Module):

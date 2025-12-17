@@ -28,15 +28,15 @@ backbone:
 head:
   - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
   - [[-1, 6], 1, Concat, [1]]  # cat backbone P4
-  - [-1, 2, C2fDMMA, [512, 8, 8, False, 1.5]]  # 11
+  - [-1, 2, C2fDMMA, [512, 8, 8, True, 2.0]]  # 11 (P4-head, shift enabled, mlp=2.0)
 
   - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
   - [[-1, 4], 1, Concat, [1]]  # cat backbone P3
-  - [-1, 2, C2fDMMA, [256, 8, 8, False, 1.5]]  # 14 (P3/8-small)
+  - [-1, 2, C2fDMMA, [256, 4, 8, True, 2.0]]  # 14 (P3/8-small, window=4 for small targets, shift enabled)
 
   - [-1, 1, Conv, [256, 3, 2]]
   - [[-1, 11], 1, Concat, [1]]  # cat head P4
-  - [-1, 2, C2fDMMA, [512, 8, 8, False, 1.5]]  # 17 (P4/16-medium)
+  - [-1, 2, C2fDMMA, [512, 8, 8, True, 2.0]]  # 17 (P4/16-medium, shift enabled, mlp=2.0)
 
   - [-1, 1, Conv, [512, 3, 2]]
   - [[-1, 8], 1, Concat, [1]]  # cat head P5
