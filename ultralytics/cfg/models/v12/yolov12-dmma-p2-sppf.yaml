@@ -1,0 +1,69 @@
+# YOLOv12-DMMA-P2-SPPF 🚀, AGPL-3.0 license
+# Ultimate version: P2 head + SPPF + Multi-scale DMMA + optimized for small ship detection
+# Key optimizations:
+# 1. P2 detection head for very small ships (stride=4)
+# 2. SPPF in backbone for multi-scale feature aggregation
+# 3. Multi-scale DMMA windows [2,4], [4,8], [8,16]
+# 4. Increased mlp_ratio (2.5) in P2/P3 layers for small targets
+# 5. More DMMA layers in neck for better feature refinement
+
+# Parameters
+nc: 1  # MASATI single class: ship
+scales:
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# Backbone with SPPF
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2, 1, 2]]  # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]  # 2 - P2 backbone feature
+  - [-1, 1, Conv, [256, 3, 2, 1, 4]]  # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]  # 4 - P3 backbone feature
+  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16
+  - [-1, 2, C2fDMMA, [512, [4, 8], 8, True, 2.0]]  # 6 MS-DMMA P4
+  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
+  - [-1, 2, C2fDMMA, [1024, [8, 16], 8, True, 2.0]]  # 8 MS-DMMA P5
+  - [-1, 1, SPPF, [1024, 5]]  # 9 SPPF for multi-scale feature fusion
+
+# Head with P2 detection (4 detection layers)
+head:
+  # === Top-down path ===
+  # P5 -> P4
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 10
+  - [[-1, 6], 1, Concat, [1]]  # 11 cat backbone P4
+  - [-1, 3, C2fDMMA, [512, [4, 8], 8, True, 2.0]]  # 12 P4 fusion (3 repeats)
+
+  # P4 -> P3
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 13
+  - [[-1, 4], 1, Concat, [1]]  # 14 cat backbone P3
+  - [-1, 3, C2fDMMA, [256, [2, 4], 8, True, 2.5]]  # 15 P3 fusion (mlp=2.5, 3 repeats)
+
+  # P3 -> P2 (for very small ships)
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 16
+  - [[-1, 2], 1, Concat, [1]]  # 17 cat backbone P2
+  - [-1, 2, C2fDMMA, [128, [2, 4], 4, True, 2.5]]  # 18 P2 fusion (4 heads for fine-grained)
+
+  # === Bottom-up path ===
+  # P2 -> P3
+  - [-1, 1, Conv, [128, 3, 2]]  # 19
+  - [[-1, 15], 1, Concat, [1]]  # 20 cat P3 top-down
+  - [-1, 3, C2fDMMA, [256, [2, 4], 8, True, 2.0]]  # 21 P3 output (3 repeats)
+
+  # P3 -> P4
+  - [-1, 1, Conv, [256, 3, 2]]  # 22
+  - [[-1, 12], 1, Concat, [1]]  # 23 cat P4 top-down
+  - [-1, 3, C2fDMMA, [512, [4, 8], 8, True, 2.0]]  # 24 P4 output (3 repeats)
+
+  # P4 -> P5
+  - [-1, 1, Conv, [512, 3, 2]]  # 25
+  - [[-1, 9], 1, Concat, [1]]  # 26 cat SPPF output
+  - [-1, 2, C3k2, [1024, True]]  # 27 P5 output
+
+  # Detect on P2, P3, P4, P5
+  - [[18, 21, 24, 27], 1, Detect, [nc]]
