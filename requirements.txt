@@ -1,6 +1,6 @@
 torch==2.2.2 
 torchvision==0.17.2
-flash_attn-2.7.3+cu11torch2.2cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+#flash_attn-2.7.3+cu11torch2.2cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
 timm==1.0.14
 albumentations==2.0.4
 onnx==1.14.0
@@ -18,3 +18,7 @@ huggingface-hub==0.23.2
 safetensors==0.4.3
 numpy==1.26.4
 supervision==0.22.0
+fastapi==0.110.3
+uvicorn==0.29.0
+pillow==10.3.0
+requests==2.32.3

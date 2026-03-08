@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
-from .transformer import TransformerBlock
+from .transformer import DMMALayer, MSDMMALayer, DASALayer, SAQKMask, TransformerBlock
 
 __all__ = (
     "DFL",
@@ -21,6 +21,9 @@ __all__ = (
     "C3",
     "C2f",
     "C2fAttn",
+    "C2fDMMA",
+    "C2fDASA",
+    "C2fDMMA_SAQK",
     "ImagePoolingAttn",
     "ContrastiveHead",
     "BNContrastiveHead",
@@ -51,6 +54,7 @@ __all__ = (
     "SCDown",
     "TorchVision",
 )
+
 
 
 class DFL(nn.Module):
@@ -469,6 +473,233 @@ class C2fAttn(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         y.append(self.attn(y[-1], guide))
         return self.cv2(torch.cat(y, 1))
+
+
+class C2fDMMA(nn.Module):
+    """C2f module enhanced with Difference Mask Mixed Attention."""
+
+    def __init__(
+        self,
+        c1,
+        c2,
+        n=1,
+        window_size=8,
+        num_heads=4,
+        shift=True,
+        mlp_ratio=4.0,
+        e=0.5,
+    ):
+        """Initialize DMMA-backed C2f block."""
+        super().__init__()
+        self.c = int(c2 * e)
+        if self.c % num_heads != 0:
+            raise ValueError(f"Channels {self.c} must be divisible by num_heads {num_heads}.")
+        window_sizes = window_size if isinstance(window_size, (list, tuple)) else [window_size]
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.multi_scale = len(window_sizes) > 1
+        self.m = nn.ModuleList()
+        for i in range(n):
+            if self.multi_scale:
+                self.m.append(
+                    MSDMMALayer(
+                        self.c,
+                        num_heads=num_heads,
+                        window_sizes=window_sizes,
+                        shift=shift and i % 2 == 1,
+                        mlp_ratio=mlp_ratio,
+                    )
+                )
+            else:
+                ws = window_sizes[0]
+                self.m.append(
+                    DMMALayer(
+                        self.c,
+                        num_heads=num_heads,
+                        window_size=ws,
+                        shift_size=(ws // 2 if (shift and i % 2 == 1) else 0),
+                        mlp_ratio=mlp_ratio,
+                    )
+                )
+
+    def forward(self, x):
+        """Forward pass through DMMA-enhanced C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class C2fDASA(nn.Module):
+    """C2f module enhanced with DASA (Dynamic Area Self-Attention).
+    
+    Uses density-driven dynamic window size selection:
+    - High-density regions -> large windows (more context)
+    - Low-density regions -> small windows (less computation)
+    
+    This aligns with the DASA concept from the paper for small target detection.
+    """
+
+    def __init__(
+        self,
+        c1,
+        c2,
+        n=1,
+        window_sizes=(4, 8, 16),  # small, medium, large windows
+        density_thresholds=(0.3, 0.7),
+        num_heads=4,
+        mlp_ratio=4.0,
+        e=0.5,
+    ):
+        """Initialize DASA-backed C2f block.
+        
+        Args:
+            c1: Input channels.
+            c2: Output channels.
+            n: Number of DASA layers.
+            window_sizes: (small, medium, large) window sizes.
+            density_thresholds: (low_th, high_th) for density classification.
+            num_heads: Number of attention heads.
+            mlp_ratio: MLP expansion ratio.
+            e: Expansion ratio for hidden channels.
+        """
+        super().__init__()
+        self.c = int(c2 * e)
+        if self.c % num_heads != 0:
+            # Adjust num_heads to be compatible
+            while self.c % num_heads != 0 and num_heads > 1:
+                num_heads -= 1
+        
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        
+        self.m = nn.ModuleList(
+            DASALayer(
+                self.c,
+                num_heads=num_heads,
+                window_sizes=window_sizes,
+                density_thresholds=density_thresholds,
+                mlp_ratio=mlp_ratio,
+            )
+            for _ in range(n)
+        )
+
+    def forward(self, x):
+        """Forward pass through DASA-enhanced C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class C2fDMMA_SAQK(nn.Module):
+    """C2f module with DMMA + SAQK-Mask (Scale-Aware Q-K Dynamic Mask).
+    
+    Combines standard DMMA with SAQK-Mask to:
+    - Boost attention for small-target queries
+    - Reduce attention for background queries
+    
+    The SAQK-Mask modulates the feature map before/after DMMA processing.
+    """
+
+    def __init__(
+        self,
+        c1,
+        c2,
+        n=1,
+        window_size=8,
+        num_heads=4,
+        shift=True,
+        mlp_ratio=4.0,
+        scale_factor=1.0,  # Related to feature map stride (P2=4, P3=8, P4=16, P5=32)
+        e=0.5,
+    ):
+        """Initialize DMMA+SAQK C2f block.
+        
+        Args:
+            c1: Input channels.
+            c2: Output channels.
+            n: Number of DMMA layers.
+            window_size: Window size(s) for DMMA.
+            num_heads: Number of attention heads.
+            shift: Whether to use shifted window attention.
+            mlp_ratio: MLP expansion ratio.
+            scale_factor: Scale factor for SAQK-Mask (smaller = more boost for small targets).
+            e: Expansion ratio.
+        """
+        super().__init__()
+        self.c = int(c2 * e)
+        if self.c % num_heads != 0:
+            raise ValueError(f"Channels {self.c} must be divisible by num_heads {num_heads}.")
+        
+        window_sizes = window_size if isinstance(window_size, (list, tuple)) else [window_size]
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.multi_scale = len(window_sizes) > 1
+        
+        # SAQK-Mask for scale-aware attention modulation
+        self.saqk = SAQKMask(self.c, scale_factor=scale_factor)
+        
+        self.m = nn.ModuleList()
+        for i in range(n):
+            if self.multi_scale:
+                self.m.append(
+                    MSDMMALayer(
+                        self.c,
+                        num_heads=num_heads,
+                        window_sizes=window_sizes,
+                        shift=shift and i % 2 == 1,
+                        mlp_ratio=mlp_ratio,
+                        use_density_gate=True,  # Use DASA-style gating
+                    )
+                )
+            else:
+                ws = window_sizes[0]
+                self.m.append(
+                    DMMALayer(
+                        self.c,
+                        num_heads=num_heads,
+                        window_size=ws,
+                        shift_size=(ws // 2 if (shift and i % 2 == 1) else 0),
+                        mlp_ratio=mlp_ratio,
+                    )
+                )
+
+    def forward(self, x):
+        """Forward pass with SAQK-Mask modulated DMMA."""
+        y = list(self.cv1(x).chunk(2, 1))
+        
+        for m in self.m:
+            feat = y[-1]
+            # Apply SAQK-Mask: boost attention for likely small targets
+            saqk_mask, _ = self.saqk(feat)
+            feat = feat * saqk_mask  # Modulate features
+            y.append(m(feat))
+        
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        
+        for m in self.m:
+            feat = y[-1]
+            saqk_mask, _ = self.saqk(feat)
+            feat = feat * saqk_mask
+            y.append(m(feat))
+        
+        return self.cv2(torch.cat(y, 1))
+
 
 
 class ImagePoolingAttn(nn.Module):

@@ -1,0 +1,11 @@
+# MASATI dataset configuration for YOLOv12.
+# Use repo-relative path so the same file works on Windows and Linux.
+
+path: MASATI
+train: images/train
+val: images/val
+test: images/test
+
+nc: 1
+names:
+  0: ship

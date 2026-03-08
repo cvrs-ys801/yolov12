@@ -22,7 +22,15 @@ __all__ = (
     "DeformableTransformerDecoderLayer",
     "MSDeformAttn",
     "MLP",
+    "DMMALayer",
+    "MSDMMALayer",
+    "DMMAChannelSpatialAttention",
+    "DensityAwareGate",
+    "SAQKMask",
+    "DASALayer",
 )
+
+
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -425,3 +433,710 @@ class DeformableTransformerDecoder(nn.Module):
             refer_bbox = refined_bbox.detach() if self.training else refined_bbox
 
         return torch.stack(dec_bboxes), torch.stack(dec_cls)
+
+
+class MinusSigmoid(nn.Module):
+    """Custom sigmoid used by the DMMA mask branch."""
+
+    def forward(self, x):
+        """Return 1 - sigmoid(x) to highlight large differences."""
+        return 1.0 - torch.sigmoid(x)
+
+
+def _to_2tuple(val):
+    """Convert an int or iterable into a 2-tuple."""
+    return (val, val) if isinstance(val, int) else val
+
+
+def _auto_eca_kernel(channels, gamma=2, b=1):
+    """
+    Compute a dynamic odd kernel size for ECA-style channel attention.
+
+    The formulation follows the ECA paper: k = |(log2(C) + b) / gamma| rounded to nearest odd.
+    """
+    k = int(abs((math.log2(channels) + b) / gamma))
+    k = k if k % 2 else k + 1
+    return max(k, 3)
+
+
+def dmma_window_partition(x, window_size):
+    """
+    Partition (B, H, W, C) tensors into non-overlapping windows.
+
+    Returns:
+        torch.Tensor: (num_windows * B, window_size, window_size, C)
+    """
+    b, h, w, c = x.shape
+    x = x.view(b, h // window_size, window_size, w // window_size, window_size, c)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    return windows.view(-1, window_size, window_size, c)
+
+
+def dmma_window_reverse(windows, window_size, h, w):
+    """Reverse dmma_window_partition."""
+    b = windows.shape[0] // (h * w // window_size // window_size)
+    x = windows.view(b, h // window_size, w // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    return x.view(b, h, w, -1)
+
+
+class DifferenceMaskAttention(nn.Module):
+    """Difference Mask Mixed Attention (DMMA) module."""
+
+    def __init__(
+        self,
+        dim,
+        window_size,
+        num_heads,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        """Initialize DMMA with windowed relative position bias and additional mask branch."""
+        super().__init__()
+        self.dim = dim
+        self.window_size = _to_2tuple(window_size)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim**-0.5
+
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), num_heads)
+        )
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += self.window_size[0] - 1
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkvm = nn.Linear(dim, dim * 4, bias=qkv_bias)
+        self.minus_sigmoid = MinusSigmoid()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.head_temperature = nn.Parameter(torch.ones(num_heads))
+        self.mask_scale = nn.Parameter(torch.ones(num_heads))
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        """Apply DMMA attention on flattened windows."""
+        b_, n, c = x.shape
+        input_dtype = x.dtype  # 记录输入数据类型以便 AMP 兼容
+        
+        x_max = torch.max(x)
+        x_min = torch.min(x)
+        x_range = torch.clamp(x_max - x_min, min=1e-6)
+        x = (x - x_min) / x_range
+
+        qkvm = self.qkvm(x).reshape(b_, n, 4, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v, m = qkvm[0], qkvm[1], qkvm[2], qkvm[3]
+        k = k * self.scale
+
+        # 差分掩码计算 - 使用 float32 确保数值稳定性
+        m_fp32 = m.float()
+        m1 = m_fp32.repeat_interleave(n, dim=3)
+        m2 = m_fp32.transpose(-2, -1).reshape(b_, self.num_heads, 1, n * (c // self.num_heads))
+        m2 = torch.abs(m2).repeat_interleave(n, dim=2)
+        m3 = torch.abs(m1 - m2).reshape(b_, self.num_heads, n, c // self.num_heads, n).permute(0, 1, 3, 2, 4)
+        m0 = m2.reshape(b_, self.num_heads, n, c // self.num_heads, n).permute(0, 1, 3, 2, 4)
+        m0 = torch.sum(m0, 2).clamp_min(1e-6)
+        m3 = torch.sum(m3, 2)
+        dm_mask = self.minus_sigmoid(m3 / m0)
+        # 转换回输入数据类型以确保 AMP 兼容
+        dm_mask = dm_mask.to(input_dtype)
+
+        attn = q @ k.transpose(-2, -1)
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1],
+            self.window_size[0] * self.window_size[1],
+            -1,
+        )
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0).to(input_dtype)
+
+        if mask is not None:
+            n_w = mask.shape[0]
+            attn = attn.view(b_ // n_w, n_w, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0).to(input_dtype)
+            attn = attn.view(-1, self.num_heads, n, n)
+        temp = self.head_temperature.view(1, self.num_heads, 1, 1).clamp(min=0.01).to(input_dtype)
+        mask_gain = self.mask_scale.view(1, self.num_heads, 1, 1).to(input_dtype)
+        attn = attn / temp
+        attn = self.softmax(attn * (dm_mask * mask_gain))
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(b_, n, c)
+        x = self.proj(x)
+        return self.proj_drop(x)
+
+
+class DMMAMlp(nn.Module):
+    """Feed-forward network for DMMA blocks."""
+
+    def __init__(self, in_features, hidden_features=None, act_layer=nn.GELU, drop=0.0):
+        super().__init__()
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        """Apply two-layer MLP with dropout."""
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        return self.drop(x)
+
+
+class DMMAChannelAttention(nn.Module):
+    """ECA-based channel interaction used inside DMMA blocks."""
+
+    def __init__(self, channels, k_size=None):
+        super().__init__()
+        k = k_size or _auto_eca_kernel(channels)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.conv_avg = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.conv_max = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self.act = nn.Sigmoid()
+
+    def forward(self, x):
+        """Return a channel-wise attention mask."""
+        input_dtype = x.dtype  # AMP 兼容
+        y_avg = self.avg_pool(x)
+        y_max = self.max_pool(x)
+        y = self.conv_avg(y_avg.squeeze(-1).transpose(-1, -2))
+        y = y + self.conv_max(y_max.squeeze(-1).transpose(-1, -2))
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        return self.act(y * self.scale.to(input_dtype))
+
+
+class DMMAChannelSpatialAttention(nn.Module):
+    """Enhanced channel + spatial mixed attention for small target detection.
+    
+    Combines ECA-style channel attention with lightweight spatial attention.
+    The spatial branch helps suppress background noise and highlight target regions.
+    """
+
+    def __init__(self, channels, k_size=None, spatial_kernel=7):
+        """Initialize channel-spatial attention module.
+        
+        Args:
+            channels: Number of input channels.
+            k_size: Kernel size for ECA convolution, auto-computed if None.
+            spatial_kernel: Kernel size for spatial attention conv (default 7).
+        """
+        super().__init__()
+        # Channel attention (ECA-style)
+        k = k_size or _auto_eca_kernel(channels)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.conv_avg = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.conv_max = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.channel_scale = nn.Parameter(torch.ones(1, channels, 1, 1))
+        
+        # Spatial attention (lightweight: concat avg+max -> conv -> sigmoid)
+        self.spatial_conv = nn.Conv2d(
+            2, 1, 
+            kernel_size=spatial_kernel, 
+            padding=spatial_kernel // 2, 
+            bias=False
+        )
+        self.spatial_bn = nn.BatchNorm2d(1)
+        
+        self.act = nn.Sigmoid()
+
+    def _channel_attention(self, x):
+        """Compute channel attention weights."""
+        input_dtype = x.dtype
+        y_avg = self.avg_pool(x)
+        y_max = self.max_pool(x)
+        y = self.conv_avg(y_avg.squeeze(-1).transpose(-1, -2))
+        y = y + self.conv_max(y_max.squeeze(-1).transpose(-1, -2))
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        return self.act(y * self.channel_scale.to(input_dtype))
+
+    def _spatial_attention(self, x):
+        """Compute spatial attention weights."""
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_features = torch.cat([avg_out, max_out], dim=1)
+        spatial_weight = self.spatial_conv(spatial_features)
+        spatial_weight = self.spatial_bn(spatial_weight)
+        return self.act(spatial_weight)
+
+    def forward(self, x):
+        """Apply sequential channel then spatial attention.
+        
+        Returns:
+            Attention-weighted feature map.
+        """
+        # Apply channel attention first
+        channel_weight = self._channel_attention(x)
+        x = x * channel_weight
+        
+        # Then apply spatial attention
+        spatial_weight = self._spatial_attention(x)
+        x = x * spatial_weight
+        
+        return x
+
+
+class DropPath(nn.Module):
+
+    """Stochastic depth regularization."""
+
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        """Randomly drop paths during training."""
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        if keep_prob > 0.0:
+            random_tensor = random_tensor / keep_prob
+        return x * random_tensor
+
+
+class DMMALayer(nn.Module):
+    """Window-based self-attention block enhanced with DMMA and channel attention."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=4,
+        window_size=8,
+        shift_size=0,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.shift_size = shift_size
+
+        self.norm1 = norm_layer(dim)
+        self.attn = DifferenceMaskAttention(
+            dim,
+            window_size=window_size,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+        self.channel_attn = DMMAChannelAttention(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = DMMAMlp(dim, int(dim * mlp_ratio), act_layer, drop)
+
+    def create_mask(self, h, w, device):
+        """Create SW-MSA mask."""
+        img_mask = torch.zeros((1, h, w, 1), device=device)
+        h_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        cnt = 0
+        for hs in h_slices:
+            for ws in w_slices:
+                img_mask[:, hs, ws, :] = cnt
+                cnt += 1
+
+        mask_windows = dmma_window_partition(img_mask, self.window_size).view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
+
+    def forward(self, x):
+        """Forward pass for DMMA Swin-like layer."""
+        b, c, h, w = x.shape
+        pad_h = (self.window_size - h % self.window_size) % self.window_size
+        pad_w = (self.window_size - w % self.window_size) % self.window_size
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        hp, wp = h + pad_h, w + pad_w
+
+        channel_mask = self.channel_attn(x).permute(0, 2, 3, 1)
+        shortcut = x.permute(0, 2, 3, 1).contiguous().view(b, hp * wp, c)
+        out = self.norm1(shortcut).view(b, hp, wp, c)
+
+        if self.shift_size > 0:
+            shifted = torch.roll(out, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            attn_mask = self.create_mask(hp, wp, out.device)
+        else:
+            shifted = out
+            attn_mask = None
+
+        windows = dmma_window_partition(shifted, self.window_size).view(-1, self.window_size * self.window_size, c)
+        attn_windows = self.attn(windows, attn_mask)
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, c)
+        shifted = dmma_window_reverse(attn_windows, self.window_size, hp, wp)
+        shifted = shifted * channel_mask.expand_as(out)
+
+        if self.shift_size > 0:
+            out = torch.roll(shifted, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            out = shifted
+
+        out = shortcut + self.drop_path(out.view(b, hp * wp, c))
+        out = out + self.drop_path(self.mlp(self.norm2(out)))
+        out = out.view(b, hp, wp, c).permute(0, 3, 1, 2).contiguous()
+
+        if pad_h or pad_w:
+            out = out[:, :, :h, :w]
+        return out
+
+
+class DensityAwareGate(nn.Module):
+    """Density-aware gate module for DASA (Dynamic Area Self-Attention).
+    
+    Computes per-region density maps and outputs dynamic weights for different
+    window size branches. Aligns with the DASA concept: high-density regions
+    get larger windows, low-density regions get smaller windows.
+    
+    Note: Uses no BatchNorm for stability with small batch sizes during
+    high-resolution training phases.
+    """
+
+    def __init__(self, channels, num_branches=2, reduction=4):
+        """Initialize density-aware gate.
+        
+        Args:
+            channels: Number of input channels.
+            num_branches: Number of window size branches to weight.
+            reduction: Channel reduction ratio for the gate network.
+        """
+        super().__init__()
+        hidden = max(channels // reduction, 16)
+        
+        # Density estimation: lightweight conv WITHOUT BatchNorm (small batch friendly)
+        # Using Conv with bias=True + ReLU is sufficient for this gating network
+        self.density_conv = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+        
+        # Gate network: maps global density to branch weights
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, num_branches),
+        )
+        
+        self.num_branches = num_branches
+
+    def forward(self, x):
+        """Compute density-driven branch weights.
+        
+        Args:
+            x: Input tensor (B, C, H, W)
+            
+        Returns:
+            weights: Branch weights (B, num_branches), softmax normalized
+            density_map: Density map (B, 1, H, W) for visualization/debugging
+        """
+        # Compute density map
+        density_map = self.density_conv(x)  # (B, 1, H, W)
+        
+        # Global average density
+        global_density = density_map.mean(dim=(2, 3))  # (B, 1)
+        
+        # Compute branch weights via MLP (softmax ensures sum to 1)
+        branch_logits = self.gate_mlp(global_density)  # (B, num_branches)
+        weights = torch.softmax(branch_logits, dim=-1)  # (B, num_branches)
+        
+        return weights, density_map
+
+
+
+class MSDMMALayer(nn.Module):
+    """Multi-scale DMMA with density-driven dynamic gates (DASA-enhanced).
+    
+    Upgraded from static learnable gates to density-aware dynamic gates.
+    High-density regions automatically favor larger windows for better
+    context aggregation; low-density regions use smaller windows to
+    reduce computation and avoid feature dilution.
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_heads=4,
+        window_sizes=(4, 8),
+        shift=False,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+        use_density_gate=False,  # Default False for stability; set True for DASA-style gating
+
+    ):
+        super().__init__()
+        self.window_sizes = list(window_sizes)
+        self.use_density_gate = use_density_gate
+        
+        # Gate selection: density-aware (DASA) or static learnable
+        if use_density_gate:
+            self.gate = DensityAwareGate(dim, num_branches=len(self.window_sizes))
+        else:
+            # Fallback: original static learnable gates
+            self.gates = nn.Parameter(torch.zeros(len(self.window_sizes)))
+        
+        self.branches = nn.ModuleList(
+            DMMALayer(
+                dim,
+                num_heads=num_heads,
+                window_size=ws,
+                shift_size=ws // 2 if shift else 0,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop=drop,
+                attn_drop=attn_drop,
+                drop_path=drop_path,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+            )
+            for ws in self.window_sizes
+        )
+
+    def forward(self, x):
+        """Fuse multi-scale DMMA outputs with density-aware dynamic gates."""
+        if self.use_density_gate:
+            # DASA: density-driven dynamic gating
+            weights, _ = self.gate(x)  # (B, num_branches)
+            out = 0
+            for i, branch in enumerate(self.branches):
+                # Per-sample weighting
+                w = weights[:, i].view(-1, 1, 1, 1)  # (B, 1, 1, 1)
+                out = out + w * branch(x)
+        else:
+            # Original: static global gates
+            weights = torch.softmax(self.gates, dim=0)
+            out = 0
+            for w, branch in zip(weights, self.branches):
+                out = out + w * branch(x)
+        return out
+
+
+class SAQKMask(nn.Module):
+    """Scale-Aware Q-K Dynamic Mask (SAQK-Mask) module.
+    
+    Generates foreground probability maps and scale-aware intensity maps
+    to control Q-K interaction weights. Small-target queries get larger
+    key visibility ranges; background queries see only local keys.
+    
+    This is a simplified v1 implementation that outputs soft masks for
+    attention modulation rather than hard sparse Q-K visibility.
+    
+    Note: scale_factor should be set according to feature map stride:
+        - P2 (stride=4): scale_factor=4
+        - P3 (stride=8): scale_factor=8
+        - P4 (stride=16): scale_factor=16
+        Smaller stride (shallower layer) = more boost for small targets.
+    """
+
+    def __init__(self, channels, scale_factor=8.0, reduction=4):
+        """Initialize SAQK-Mask module.
+        
+        Args:
+            channels: Number of input channels.
+            scale_factor: Feature map stride (e.g., 4, 8, 16, 32).
+                         Smaller values = shallower layers = more boost.
+            reduction: Channel reduction ratio.
+        """
+        super().__init__()
+        hidden = max(channels // reduction, 16)
+        num_groups = min(8, hidden)  # For GroupNorm
+        
+        # Foreground probability estimation (using GroupNorm for small batch stability)
+        self.fg_conv = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups, hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+        
+        # Scale-aware intensity modulation
+        # FIXED: Smaller scale_factor (shallower layer) should produce LARGER boost
+        # We use 1/scale_factor so P2 (scale=4) gets more boost than P4 (scale=16)
+        self.scale_factor = scale_factor
+        self.inverse_scale = nn.Parameter(torch.ones(1) / max(scale_factor, 1.0))
+        
+        # Output: attention boost factor for small targets (using GroupNorm)
+        self.boost_conv = nn.Sequential(
+            nn.Conv2d(1, hidden, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups, hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, kernel_size=1, bias=True),
+        )
+        
+        # Learnable alpha for residual-style modulation (starts small for stability)
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        """Generate scale-aware attention modulation mask.
+        
+        Args:
+            x: Input tensor (B, C, H, W)
+            
+        Returns:
+            mask: Attention modulation mask (B, 1, H, W), centered around 1.0
+                  Values > 1 = boost attention for small targets
+                  Values < 1 = suppress background
+            fg_prob: Foreground probability (B, 1, H, W)
+        """
+        # Foreground probability
+        fg_prob = self.fg_conv(x)  # (B, 1, H, W)
+        
+        # Scale-aware intensity: smaller scale_factor = larger inverse_scale = more boost
+        # P2 (scale=4) -> inverse_scale=0.25 initially, but learnable
+        # The learnable inverse_scale can adapt during training
+        intensity = fg_prob * self.inverse_scale * 10.0  # Scale up for better gradient flow
+        
+        # Generate raw boost factor
+        boost = self.boost_conv(intensity)
+        
+        # FIXED: Use narrower range [0.9, 1.1] with residual-style modulation
+        # mask = 1 + alpha * tanh(boost) where alpha starts at 0 for stable warmup
+        # As training progresses, alpha grows and mask can deviate more from 1.0
+        alpha_clamped = torch.sigmoid(self.alpha) * 0.2  # Max alpha = 0.2 -> range [0.8, 1.2]
+        mask = 1.0 + alpha_clamped * torch.tanh(boost)
+        
+        return mask, fg_prob
+
+
+class DASALayer(nn.Module):
+    """Dynamic Area Self-Attention (DASA) Layer.
+    
+    Full implementation of DASA concept:
+    1. Density/entropy estimation via lightweight conv
+    2. Dual-threshold region classification (high/medium/low density)
+    3. Dynamic window size selection per region
+    4. Attention computation with selected window sizes
+    
+    This is a complete attention block that replaces standard window attention.
+    
+    Note: 
+    - Training: uses soft masks (all branches computed, gradient-friendly)
+    - For inference efficiency, consider hard gating (future optimization)
+    - Uses no BatchNorm for small batch stability
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_heads=4,
+        window_sizes=(4, 8, 16),  # small, medium, large windows
+        density_thresholds=(0.3, 0.7),  # (low_th, high_th)
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+    ):
+        """Initialize DASA layer.
+        
+        Args:
+            dim: Input dimension.
+            num_heads: Number of attention heads.
+            window_sizes: Tuple of (small, medium, large) window sizes.
+            density_thresholds: (low_threshold, high_threshold) for region classification.
+            mlp_ratio: MLP expansion ratio.
+        """
+        super().__init__()
+        self.dim = dim
+        self.window_sizes = window_sizes
+        self.low_th, self.high_th = density_thresholds
+        
+        # Density estimation network (NO BatchNorm for small batch stability)
+        self.density_net = nn.Sequential(
+            nn.Conv2d(dim, dim // 4, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim // 4, 1, kernel_size=3, padding=1, bias=True),
+            nn.Sigmoid()
+        )
+        
+        # Three branches for different window sizes
+        # Low density -> small window (less computation)
+        # Medium density -> medium window
+        # High density -> large window (more context)
+        self.branch_small = DMMALayer(
+            dim, num_heads=num_heads, window_size=window_sizes[0],
+            shift_size=0, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+            drop=drop, attn_drop=attn_drop, drop_path=drop_path,
+        )
+        self.branch_medium = DMMALayer(
+            dim, num_heads=num_heads, window_size=window_sizes[1],
+            shift_size=window_sizes[1] // 2, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+            drop=drop, attn_drop=attn_drop, drop_path=drop_path,
+        )
+        self.branch_large = DMMALayer(
+            dim, num_heads=num_heads, window_size=window_sizes[2],
+            shift_size=window_sizes[2] // 2, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+            drop=drop, attn_drop=attn_drop, drop_path=drop_path,
+        )
+
+    def forward(self, x):
+        """Forward with density-adaptive window selection.
+        
+        Args:
+            x: Input tensor (B, C, H, W)
+            
+        Returns:
+            out: Output tensor (B, C, H, W)
+        """
+        b, c, h, w = x.shape
+        
+        # 1. Compute density map
+        density = self.density_net(x)  # (B, 1, H, W)
+        
+        # 2. Generate logits for each density level and use softmax for normalization
+        # This ensures weights sum to 1.0, avoiding feature scale drift
+        logit_low = -10.0 * (density - self.low_th)  # High when D < low_th
+        logit_high = 10.0 * (density - self.high_th)  # High when D > high_th
+        logit_medium = torch.zeros_like(density)  # Baseline for medium
+        
+        # Stack and apply softmax along the branch dimension
+        logits = torch.cat([logit_low, logit_medium, logit_high], dim=1)  # (B, 3, H, W)
+        weights = torch.softmax(logits, dim=1)  # (B, 3, H, W), sum to 1 along dim=1
+        
+        mask_low = weights[:, 0:1, :, :]  # (B, 1, H, W)
+        mask_medium = weights[:, 1:2, :, :]
+        mask_high = weights[:, 2:3, :, :]
+        
+        # 3. Process through each branch (all computed for gradient flow)
+        out_small = self.branch_small(x) * mask_low
+        out_medium = self.branch_medium(x) * mask_medium
+        out_large = self.branch_large(x) * mask_high
+        
+        # 4. Combine with normalized weights (sum to 1, no feature scale drift)
+        out = out_small + out_medium + out_large
+        
+        return out
+
