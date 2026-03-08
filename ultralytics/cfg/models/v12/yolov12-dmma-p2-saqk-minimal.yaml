@@ -1,0 +1,69 @@
+# YOLOv12-DMMA-P2-SAQK-Minimal
+# AGPL-3.0 license
+# Minimal enhancement: ONLY adds SAQK to P2 layer
+# All other layers are IDENTICAL to yolov12-dmma-p2-efficient.yaml
+#
+# Rationale: P2 is most critical for small ship detection
+# SAQK boosts attention for small targets at this layer
+
+# Parameters
+nc: 1  # MASATI single class: ship
+scales:
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# Backbone - IDENTICAL to efficient
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2, 1, 2]]  # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]  # 2 - P2 backbone feature
+  - [-1, 1, Conv, [256, 3, 2, 1, 4]]  # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]  # 4 - P3 backbone feature
+  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16
+  - [-1, 2, C2fDMMA, [512, 8, 8, True, 2.0]]  # 6 DMMA (same as efficient)
+  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
+  - [-1, 2, C2fDMMA, [1024, 16, 8, True, 2.0]]  # 8 DMMA (same as efficient)
+
+# Head - Only P2 uses C2fDMMA_SAQK, all others IDENTICAL to efficient
+head:
+  # === Top-down path ===
+  # P5 -> P4
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 9
+  - [[-1, 6], 1, Concat, [1]]  # 10 cat backbone P4
+  - [-1, 2, C2fDMMA, [512, 8, 8, True, 1.5]]  # 11 DMMA (same as efficient)
+
+  # P4 -> P3
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 12
+  - [[-1, 4], 1, Concat, [1]]  # 13 cat backbone P3
+  - [-1, 2, C2fDMMA, [256, 4, 8, True, 1.5]]  # 14 DMMA (same as efficient)
+
+  # P3 -> P2 (ONLY change: use SAQK here!)
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 15
+  - [[-1, 2], 1, Concat, [1]]  # 16 cat backbone P2
+  # C2fDMMA_SAQK: [out_ch, window_size, heads, shift, mlp_ratio, scale_factor]
+  # scale_factor=4 (stride of P2) for maximum small-target boost
+  - [-1, 1, C2fDMMA_SAQK, [128, 4, 4, True, 1.0, 4]]  # 17 SAQK-enhanced P2!
+
+  # === Bottom-up path (IDENTICAL to efficient) ===
+  # P2 -> P3
+  - [-1, 1, Conv, [128, 3, 2]]  # 18
+  - [[-1, 14], 1, Concat, [1]]  # 19 cat P3 top-down
+  - [-1, 2, C2fDMMA, [256, 4, 8, True, 1.5]]  # 20 DMMA
+
+  # P3 -> P4
+  - [-1, 1, Conv, [256, 3, 2]]  # 21
+  - [[-1, 11], 1, Concat, [1]]  # 22 cat P4 top-down
+  - [-1, 2, C2fDMMA, [512, 8, 8, True, 1.5]]  # 23 DMMA
+
+  # P4 -> P5
+  - [-1, 1, Conv, [512, 3, 2]]  # 24
+  - [[-1, 8], 1, Concat, [1]]  # 25 cat backbone P5
+  - [-1, 2, C3k2, [1024, True]]  # 26 P5 output
+
+  # Detect on P2, P3, P4, P5
+  - [[17, 20, 23, 26], 1, Detect, [nc]]

@@ -1,7 +1,7 @@
-# MASATI dataset configuration for YOLOv12
-# Root directory already contains images/ and labels/ subfolders in YOLO format.
+# MASATI dataset configuration for YOLOv12.
+# Use repo-relative path so the same file works on Windows and Linux.
 
-path: /usr/sangui/PythonProject/yolov12/MASATI
+path: MASATI
 train: images/train
 val: images/val
 test: images/test

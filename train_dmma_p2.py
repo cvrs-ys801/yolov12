@@ -1,202 +1,143 @@
 #!/usr/bin/env python3
-"""
-YOLOv12-DMMA-P2 训练脚本
-针对 MASATI 船舶检测数据集优化
+"""Cross-platform trainer for YOLOv12-DMMA-P2-Efficient on MASATI.
 
-作者: Antigravity
-日期: 2025-12-18
-
-使用方法:
-    # 方法1: 直接运行Python脚本
-    python train_dmma_p2.py
-    
-    # 方法2: 使用CLI命令 (参见文件末尾的注释)
-
-硬件要求:
-    - RTX 4090 (24GB VRAM)
-    - batch_size=24 对于 P2 版本
-    - batch_size=32 对于标准版本
+Designed for development on Windows and training on Linux.
 """
 
-from ultralytics import YOLO
+from __future__ import annotations
 
-# ============================================================
-# 配置参数
-# ============================================================
+import argparse
+import os
+from pathlib import Path
+from typing import Any
 
-# 模型配置选择:
-# 1. yolov12-dmma-p2.yaml       - P2检测头版本 (推荐优先尝试)
-# 2. yolov12-dmma-p2-sppf.yaml  - P2 + SPPF版本 (更强但更慢)
-# 3. yolov12-dmma-ms.yaml       - 原多尺度版本 (基线对比)
-
-MODEL_CONFIG = "ultralytics/cfg/models/v12/yolov12-dmma-p2.yaml"
-DATA_CONFIG = "data/masati.yaml"
-
-# 训练超参数
-TRAIN_PARAMS = {
-    # 基础参数
-    "epochs": 300,                # 训练轮数
-    "batch": 24,                  # P2版本建议24,显存更紧张
-    "imgsz": 640,                 # 输入图像尺寸
-    "device": 0,                  # GPU设备号
-    
-    # 学习率
-    "lr0": 0.01,                  # 初始学习率
-    "lrf": 0.01,                  # 最终学习率 = lr0 * lrf
-    "momentum": 0.937,            # SGD动量
-    "weight_decay": 0.0005,       # 权重衰减
-    "warmup_epochs": 3.0,         # 预热轮数
-    "warmup_momentum": 0.8,       # 预热动量
-    
-    # 数据增强 - 针对小目标优化
-    "mosaic": 1.0,                # Mosaic增强概率
-    "mixup": 0.15,                # MixUp增强 (小目标有效)
-    "copy_paste": 0.3,            # 复制粘贴增强 (小目标有效)
-    "scale": 0.5,                 # 尺度抖动范围
-    "degrees": 10.0,              # 随机旋转角度
-    "translate": 0.1,             # 随机平移
-    "shear": 2.0,                 # 剪切变换
-    "flipud": 0.5,                # 垂直翻转 (遥感图像适用)
-    "fliplr": 0.5,                # 水平翻转
-    "hsv_h": 0.015,               # 色调增强
-    "hsv_s": 0.7,                 # 饱和度增强
-    "hsv_v": 0.4,                 # 亮度增强
-    "erasing": 0.4,               # 随机擦除
-    
-    # 训练策略
-    "close_mosaic": 15,           # 最后N轮关闭Mosaic
-    "patience": 50,               # 早停耐心值
-    "save_period": 20,            # 每N轮保存检查点
-    "amp": True,                  # 混合精度训练
-    "workers": 8,                 # DataLoader工作进程数
-    "cache": False,               # 是否缓存图像 (内存充足可True)
-    
-    # 输出设置
-    "project": "runs/detect",
-    "name": "dmma_p2_masati",
-    "exist_ok": True,
-    "verbose": True,
-}
+ROOT = Path(__file__).resolve().parent
+DEFAULT_MODEL = "ultralytics/cfg/models/v12/yolov12-dmma-p2-efficient.yaml"
+DEFAULT_DATA = "data/masati.yaml"
+DEFAULT_SOURCE = "MASATI/images/test"
 
 
-def train():
-    """执行训练"""
-    print("=" * 60)
-    print("YOLOv12-DMMA-P2 训练开始")
-    print(f"模型配置: {MODEL_CONFIG}")
-    print(f"数据配置: {DATA_CONFIG}")
-    print("=" * 60)
-    
-    # 加载模型
-    model = YOLO(MODEL_CONFIG)
-    
-    # 开始训练
-    results = model.train(
-        data=DATA_CONFIG,
-        **TRAIN_PARAMS
-    )
-    
-    print("\n" + "=" * 60)
-    print("训练完成!")
-    print(f"最佳模型: {results.save_dir}/weights/best.pt")
-    print("=" * 60)
-    
-    return results
+def norm_path(value: str) -> str:
+    """Normalize path separators for current OS while preserving relative paths."""
+    return str(Path(value))
 
 
-def validate(weights_path: str = None):
-    """验证模型"""
-    if weights_path is None:
-        weights_path = f"runs/detect/{TRAIN_PARAMS['name']}/weights/best.pt"
-    
-    model = YOLO(weights_path)
-    results = model.val(
-        data=DATA_CONFIG,
-        imgsz=640,
-        device=0,
-        verbose=True,
-    )
-    return results
+def parse_device(device: str | int | None) -> str | int:
+    """Accept values like 0, '0', '0,1', 'cpu', or empty (auto)."""
+    if device is None:
+        return 0
+    text = str(device).strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    return text
 
 
-def predict(weights_path: str = None, source: str = "MASATI/images/test"):
-    """推理预测"""
-    if weights_path is None:
-        weights_path = f"runs/detect/{TRAIN_PARAMS['name']}/weights/best.pt"
-    
-    model = YOLO(weights_path)
-    results = model.predict(
-        source=source,
+def base_params(device: str | int) -> dict[str, Any]:
+    return {
+        "epochs": 300,
+        "batch": 16,
+        "imgsz": 640,
+        "device": device,
+        "optimizer": "AdamW",
+        "lr0": 0.001,
+        "lrf": 0.01,
+        "weight_decay": 0.05,
+        "warmup_epochs": 3.0,
+        "box": 10.0,
+        "cls": 0.3,
+        "dfl": 1.5,
+        "mosaic": 1.0,
+        "mixup": 0.2,
+        "copy_paste": 0.5,
+        "scale": 0.9,
+        "degrees": 15.0,
+        "translate": 0.15,
+        "flipud": 0.5,
+        "fliplr": 0.5,
+        "erasing": 0.4,
+        "close_mosaic": 20,
+        "patience": 50,
+        "amp": True,
+        "workers": 8,
+        "project": "runs/detect",
+        "name": "dmma_p2_efficient_masati",
+        "exist_ok": True,
+        "verbose": True,
+    }
+
+
+def train(model_cfg: str, data_cfg: str, device: str | int, epochs: int, batch: int, imgsz: int):
+    from ultralytics import YOLO
+
+    model = YOLO(norm_path(model_cfg))
+    params = base_params(device)
+    params.update({"epochs": epochs, "batch": batch, "imgsz": imgsz})
+    return model.train(data=norm_path(data_cfg), **params)
+
+
+def validate(weights: str, data_cfg: str, device: str | int, imgsz: int):
+    from ultralytics import YOLO
+
+    model = YOLO(norm_path(weights))
+    return model.val(data=norm_path(data_cfg), imgsz=imgsz, device=device, verbose=True)
+
+
+def predict(weights: str, source: str, device: str | int):
+    from ultralytics import YOLO
+
+    model = YOLO(norm_path(weights))
+    return model.predict(
+        source=norm_path(source),
         conf=0.25,
         iou=0.45,
-        device=0,
+        device=device,
         save=True,
         verbose=True,
     )
-    return results
+
+
+def default_best(weights_name: str) -> str:
+    return str(ROOT / "runs" / "detect" / weights_name / "weights" / "best.pt")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="YOLOv12-DMMA-P2-Efficient training helper")
+    parser.add_argument("mode", choices=["train", "val", "predict"], nargs="?", default="train")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model yaml or weights path")
+    parser.add_argument("--data", default=DEFAULT_DATA, help="Dataset yaml")
+    parser.add_argument("--weights", default=None, help="Weights for val/predict")
+    parser.add_argument("--source", default=DEFAULT_SOURCE, help="Predict source")
+    parser.add_argument("--device", default=os.getenv("YOLO_DEVICE", "0"), help="0 | 0,1 | cpu")
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--name", default="dmma_p2_efficient_masati")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    device = parse_device(args.device)
+
+    if args.mode == "train":
+        results = train(args.model, args.data, device, args.epochs, args.batch, args.imgsz)
+        print(f"Training complete. Best: {results.save_dir}/weights/best.pt")
+        return
+
+    weights = args.weights or default_best(args.name)
+    if not Path(weights).exists():
+        raise FileNotFoundError(f"Weights not found: {weights}")
+
+    if args.mode == "val":
+        validate(weights, args.data, device, args.imgsz)
+        print("Validation complete.")
+        return
+
+    predict(weights, args.source, device)
+    print("Prediction complete.")
 
 
 if __name__ == "__main__":
-    # 执行训练
-    train()
-    
-    # 训练完成后可取消注释执行验证和预测
-    # validate()
-    # predict()
-
-
-# ============================================================
-# CLI 命令参考 (可替代Python脚本使用)
-# ============================================================
-"""
-# 标准训练 - P2检测头版本 (推荐)
-yolo detect train \
-    model=ultralytics/cfg/models/v12/yolov12-dmma-p2.yaml \
-    data=data/masati.yaml \
-    epochs=300 \
-    batch=24 \
-    imgsz=640 \
-    lr0=0.01 \
-    device=0 \
-    project=runs/detect \
-    name=dmma_p2_masati \
-    mosaic=1.0 \
-    mixup=0.15 \
-    copy_paste=0.3 \
-    scale=0.5 \
-    flipud=0.5 \
-    patience=50 \
-    close_mosaic=15 \
-    amp=True
-
-# P2+SPPF 终极版本 (更强精度,更慢速度)
-yolo detect train \
-    model=ultralytics/cfg/models/v12/yolov12-dmma-p2-sppf.yaml \
-    data=data/masati.yaml \
-    epochs=300 \
-    batch=20 \
-    imgsz=640 \
-    lr0=0.008 \
-    device=0 \
-    project=runs/detect \
-    name=dmma_p2_sppf_masati \
-    mosaic=1.0 \
-    mixup=0.15 \
-    copy_paste=0.3 \
-    patience=50 \
-    amp=True
-
-# 验证
-yolo detect val \
-    weights=runs/detect/dmma_p2_masati/weights/best.pt \
-    data=data/masati.yaml \
-    imgsz=640 \
-    device=0
-
-# 推理
-yolo detect predict \
-    weights=runs/detect/dmma_p2_masati/weights/best.pt \
-    source=MASATI/images/test \
-    conf=0.25 \
-    device=0
-"""
+    main()

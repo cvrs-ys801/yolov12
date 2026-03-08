@@ -891,7 +891,8 @@ class MSDMMALayer(nn.Module):
         drop_path=0.0,
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
-        use_density_gate=True,  # New: enable DASA-style dynamic gating
+        use_density_gate=False,  # Default False for stability; set True for DASA-style gating
+
     ):
         super().__init__()
         self.window_sizes = list(window_sizes)
